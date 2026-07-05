@@ -1,0 +1,40 @@
+#######################################
+# Syntax Coloring Map For LynkTuya
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+LynkTuyaDevice	KEYWORD1
+TuyaProtocolVersion	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+connectToPlug	KEYWORD2
+closeConnection	KEYWORD2
+handshake	KEYWORD2
+getStatus	KEYWORD2
+getRelayState	KEYWORD2
+lastJson	KEYWORD2
+turnOn	KEYWORD2
+turnOff	KEYWORD2
+turn	KEYWORD2
+setDps	KEYWORD2
+heartbeat	KEYWORD2
+poll	KEYWORD2
+onDpsUpdate	KEYWORD2
+setTimeout	KEYWORD2
+timeBegin	KEYWORD2
+updateTime	KEYWORD2
+syncWithNTP	KEYWORD2
+updateTimeAndAppend	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+TUYA_V34	LITERAL1
+TUYA_V35	LITERAL1
