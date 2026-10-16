@@ -94,40 +94,37 @@ public:
     _seqNo = 3;
     return true;
   }
-
-  // ---------- Status ----------
-  bool getStatus(bool autoCloseConnection = true) {
+  
+  // ---------- Heartbeat 0x09 HEART_BEAT ----------
+  // Keeps a long-lived connection alive (command 9). Call every ~10s to
+  // hold a connection open, otherwise the device drops it.
+  bool heartbeat(bool autoCloseConnection = false) {
     if (!_ensureSession()) {
       if (autoCloseConnection) closeConnection();
       return false;
     }
-    const uint8_t emptyJson[2] = { '{', '}' };
-    bool ok = _sendSessionFrame(0x10, emptyJson, 2) && _awaitResponse(0x10) && _parseCommandResponse();
+    bool ok = _sendSessionFrame(0x09, nullptr, 0) && _awaitResponse(0x09);
     if (autoCloseConnection) closeConnection();
     return ok;
   }
 
-  // Same as getStatus() but also copies the device's decrypted status JSON
-  // (e.g. {"dps":{"1":true,"9":0}}) into jsonOut.
-  bool getStatus(String &jsonOut, bool autoCloseConnection = true) {
-    if (!getStatus(autoCloseConnection)) return false;
-    jsonOut = _lastJson;
+  // Processes one pending frame on an open connection, dispatching dps
+  // pushes to the onDpsUpdate callback. With waitMs = 0 it returns
+  // immediately when no data is pending. Returns true if a frame was read.
+  bool poll(uint32_t waitMs = 0) {
+    if (!_client->connected()) return false;
+    if (waitMs == 0 && !_client->available()) return false;
+    // With waitMs = 0 a frame has already started arriving; give it a short,
+    // bounded window to finish rather than the full response timeout, so a
+    // stalled or partial frame can't block the caller's loop() for seconds.
+    uint32_t frameTimeout = (waitMs == 0) ? POLL_FRAME_TIMEOUT_MS : waitMs;
+    int cmd = _readFrame(frameTimeout);
+    if (cmd < 0) return false;
+    if (cmd == 0x08) _handlePush();
     return true;
   }
 
-  // Reads the device status and extracts the boolean state of one dps id.
-  // Returns false if the request failed or the dps id is not a boolean.
-  bool getRelayState(bool &isOn, const char* dpsId = "1", bool autoCloseConnection = true) {
-    if (!getStatus(autoCloseConnection)) return false;
-    return _dpsBoolFromJson(_lastJson, dpsId, isOn);
-  }
-
-  // Decrypted JSON payload of the last successful response or push.
-  const String& lastJson() const {
-    return _lastJson;
-  }
-
-  // ---------- Control ----------
+  // ---------- Control 0x0D CONTROL_NEW New control frame----------
   bool turnOn(uint32_t timestamp, bool autoCloseConnection = true, const char* dpsId = "1") {
     return turn(timestamp, true, autoCloseConnection, dpsId);
   }
@@ -170,33 +167,55 @@ public:
     return _setDpsLiteral(dpsId, literal, autoCloseConnection, timestamp);
   }
 
-  // ---------- Persistent connections ----------
-  // Keeps a long-lived connection alive (command 9). Call every ~10 s when
-  // holding a connection open, otherwise the device drops it.
-  bool heartbeat(bool autoCloseConnection = false) {
+  // ---------- Status 0x10 DP_QUERY_NEW New DP query----------
+  bool getStatus(bool autoCloseConnection = true, bool forceRefresh = false) {
+    if (forceRefresh && !updateDps("1", false)) return false;
     if (!_ensureSession()) {
       if (autoCloseConnection) closeConnection();
       return false;
     }
-    bool ok = _sendSessionFrame(0x09, nullptr, 0) && _awaitResponse(0x09);
+    const uint8_t emptyJson[2] = { '{', '}' };
+    bool ok = _sendSessionFrame(0x10, emptyJson, 2) && _awaitResponse(0x10) && _parseCommandResponse();
     if (autoCloseConnection) closeConnection();
     return ok;
   }
 
-  // Processes one pending frame on an open connection, dispatching dps
-  // pushes to the onDpsUpdate callback. With waitMs = 0 it returns
-  // immediately when no data is pending. Returns true if a frame was read.
-  bool poll(uint32_t waitMs = 0) {
-    if (!_client->connected()) return false;
-    if (waitMs == 0 && !_client->available()) return false;
-    // With waitMs = 0 a frame has already started arriving; give it a short,
-    // bounded window to finish rather than the full response timeout, so a
-    // stalled or partial frame can't block the caller's loop() for seconds.
-    uint32_t frameTimeout = (waitMs == 0) ? POLL_FRAME_TIMEOUT_MS : waitMs;
-    int cmd = _readFrame(frameTimeout);
-    if (cmd < 0) return false;
-    if (cmd == 0x08) _handlePush();
+  // Same as getStatus() but also copies the device's decrypted status JSON
+  // (e.g. {"dps":{"1":true,"9":0}}) into jsonOut.
+  bool getStatus(String &jsonOut, bool autoCloseConnection = true, bool forceRefresh = false) {
+    if (!getStatus(autoCloseConnection, forceRefresh)) return false;
+    jsonOut = _lastJson;
     return true;
+  }
+
+  // Reads the device status and extracts the boolean state of one dps id.
+  // Returns false if the request failed or the dps id is not a boolean.
+  bool getRelayState(bool &isOn, const char* dpsId = "1", bool autoCloseConnection = true, bool forceRefresh = false) {
+    if(forceRefresh && !updateDps(dpsId, false)) return false;
+    if (!getStatus(autoCloseConnection)) return false;
+    return _dpsBoolFromJson(_lastJson, dpsId, isOn);
+  }
+
+  // Decrypted JSON payload of the last successful response or push.
+  const String& lastJson() const {
+    return _lastJson;
+  }
+
+  // ---------- Refresh DPS 0x12 UPDATEDPS Request async DP refresh----------
+  bool updateDps(const char* dpIds = "1", bool autoCloseConnection = true) {
+    if (!_ensureSession()) {
+      if (autoCloseConnection) closeConnection();
+      return false;
+    }
+    if (sizeof(dpIds) + 11 > PAYLOAD_BUFFER_SIZE - 16) {
+      Serial.println(F("Payload buffer is not enough to store json, increase PAYLOAD_BUFFER_SIZE"));
+      return false;
+    }
+    char plain[PAYLOAD_BUFFER_SIZE];
+    int len = snprintf(plain, PAYLOAD_BUFFER_SIZE, "{\"dpId\":[%s]}", dpIds);
+    bool ok = _sendSessionFrame(0x12, (const uint8_t*)plain, len);
+    if (autoCloseConnection) closeConnection();
+    return ok;
   }
 
 private:

@@ -19,6 +19,7 @@ IPAddress plugIP(192, 168, 1, 11);          // device IP, recommended to make it
 // Pick the template parameter that matches your device: TUYA_V34 or TUYA_V35
 LynkTuyaDevice<TUYA_V35> plug(plugIP, PLUG_KEY);
 uint32_t lastHeartbeatMillis;
+uint32_t lastGetStatusMillis;
 
 void onDpsUpdate(const String &json) {
   Serial.print("Device pushed an update: ");
@@ -27,7 +28,7 @@ void onDpsUpdate(const String &json) {
 
 void setup() {
   Serial.begin(115200);
-  delay(3000);
+  delay(5000);
   connectWifi();
   timeBegin();
 
@@ -61,6 +62,7 @@ void setup() {
 }
 
 void loop() {
+  /*
   plug.poll();  // dispatches pushed dps updates to the callback
 
   if (millis() - lastHeartbeatMillis > 10000) {
@@ -71,7 +73,29 @@ void loop() {
       if (plug.connectToPlug()) plug.handshake();
     }
   }
+  */
   delay(50);
+
+  if (millis() - lastGetStatusMillis > 5000) {
+    lastGetStatusMillis = millis();
+    
+    /*
+    //Send updateDps before getStatus for forceRefresh DPS values, or pass third parameter as true
+    if (plug.updateDps("1")) {
+      Serial.println("Update request sent");
+    } else {
+      Serial.println("Update request failed");
+    }
+    */
+    String json;
+    // Full status JSON
+    if (plug.getStatus(json, false, true)) {
+      Serial.print("Device status: ");
+      Serial.println(json);
+    } else {
+      Serial.println("Status request failed");
+    }
+  }
 }
 
 void connectWifi() {
