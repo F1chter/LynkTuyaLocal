@@ -154,16 +154,22 @@ static void expectedSessionKeyV35(uint8_t out[16]) {
 
 /*==================== Device-side frame builders ====================*/
 
-// v3.4 device frame: 000055AA | seq | cmd | len | retcode | payload | hmac(32, zeros) | 0000AA55
-static std::vector<uint8_t> v34DeviceFrame(uint32_t seq, uint32_t cmd, const std::vector<uint8_t>& encPayload) {
+// v3.4 device frame: header | optional retcode | ciphertext | HMAC | suffix.
+static std::vector<uint8_t> v34DeviceFrame(uint32_t seq, uint32_t cmd,
+                                           const std::vector<uint8_t>& encPayload,
+                                           bool retcode = true) {
   std::vector<uint8_t> f;
   f.insert(f.end(), {0x00, 0x00, 0x55, 0xAA});
   putU32(f, seq);
   putU32(f, cmd);
-  putU32(f, 4 + (uint32_t)encPayload.size() + 32 + 4);
-  putU32(f, 0);  // retcode
+  putU32(f, (retcode ? 4 : 0) + (uint32_t)encPayload.size() + 32 + 4);
+  if (retcode) putU32(f, 0);
   f.insert(f.end(), encPayload.begin(), encPayload.end());
-  f.insert(f.end(), 32, 0x00);  // hmac (not verified by the library)
+  uint8_t digest[32];
+  uint8_t sessionKey[16];
+  expectedSessionKeyV34(sessionKey);
+  hmac256(cmd == 0x04 ? LOCAL_KEY : sessionKey, f.data(), f.size(), digest);
+  f.insert(f.end(), digest, digest + 32);
   f.insert(f.end(), {0x00, 0x00, 0xAA, 0x55});
   return f;
 }
@@ -176,7 +182,9 @@ static std::vector<uint8_t> v34Cmd4Response() {
   return v34DeviceFrame(1, 0x04, std::vector<uint8_t>(payload, payload + 48));
 }
 
-static std::vector<uint8_t> v34JsonFrame(uint32_t seq, uint32_t cmd, const char* json, const uint8_t* sessionKey, bool versionHeader) {
+static std::vector<uint8_t> v34JsonFrame(uint32_t seq, uint32_t cmd, const char* json,
+                                          const uint8_t* sessionKey, bool versionHeader,
+                                          bool retcode = true) {
   uint8_t plain[PAYLOAD_BUFFER_SIZE];
   size_t len = 0;
   if (versionHeader) {
@@ -187,7 +195,7 @@ static std::vector<uint8_t> v34JsonFrame(uint32_t seq, uint32_t cmd, const char*
   memcpy(plain + len, json, strlen(json));
   len = pkcs7(plain, len + strlen(json));
   ecb(sessionKey, plain, len, MBEDTLS_AES_ENCRYPT);
-  return v34DeviceFrame(seq, cmd, std::vector<uint8_t>(plain, plain + len));
+  return v34DeviceFrame(seq, cmd, std::vector<uint8_t>(plain, plain + len), retcode);
 }
 
 static std::vector<uint8_t> v34EmptyAck(uint32_t seq, uint32_t cmd) {
@@ -422,6 +430,72 @@ static void testV34Fragmented() {
   CHECK(on == false);
 }
 
+static std::vector<uint8_t> v34PaddedCmd4(bool retcode, bool versionHeader,
+                                           bool badInnerHmac = false) {
+  uint8_t plain[64] = {};
+  size_t offset = 0;
+  if (versionHeader) {
+    memcpy(plain, "3.4", 3);
+    offset = 15;
+  }
+  memcpy(plain + offset, DEVICE_NONCE, 16);
+  hmac256(LOCAL_KEY, LOCAL_NONCE, 16, plain + offset + 16);
+  if (badInnerHmac) plain[offset + 16] ^= 1;
+  memset(plain + offset + 48, versionHeader ? 1 : 16, 64 - offset - 48);
+  ecb(LOCAL_KEY, plain, 64, MBEDTLS_AES_ENCRYPT);
+  return v34DeviceFrame(1, 0x04, std::vector<uint8_t>(plain, plain + 64), retcode);
+}
+
+static void testV34AuthenticatedLayouts() {
+  printf("-- v3.4 authenticated response layouts --\n");
+  uint8_t sessionKey[16];
+  expectedSessionKeyV34(sessionKey);
+  for (int variant = 0; variant < 3; ++variant) {
+    MockClient mock;
+    LynkTuyaDevice<TUYA_V34> dev(IPAddress(1, 2, 3, 4), (const char*)LOCAL_KEY, mock);
+    dev.setTimeout(100);
+    mock.preload(v34PaddedCmd4(variant != 1, variant == 2));
+    mock.preload(v34JsonFrame(3, 0x10, "{\"dps\":{\"1\":true}}",
+                              sessionKey, false, variant != 1));
+    String json;
+    CHECK(dev.getStatus(json, false));
+    CHECK(json == "{\"dps\":{\"1\":true}}");
+  }
+
+  auto expectRejectedStatus = [&](std::vector<uint8_t> response) {
+    MockClient mock;
+    LynkTuyaDevice<TUYA_V34> dev(IPAddress(1, 2, 3, 4), (const char*)LOCAL_KEY, mock);
+    dev.setTimeout(100);
+    mock.preload(v34Cmd4Response());
+    mock.preload(response);
+    CHECK(!dev.getStatus(false));
+  };
+  auto valid = v34JsonFrame(3, 0x10, "{\"dps\":{\"1\":true}}", sessionKey, false);
+  auto badHmac = valid;
+  badHmac[badHmac.size() - 36] ^= 1;
+  expectRejectedStatus(badHmac);
+  auto badSuffix = valid;
+  badSuffix.back() ^= 1;
+  expectRejectedStatus(badSuffix);
+  auto errorCode = valid;
+  errorCode[19] = 1;
+  hmac256(sessionKey, errorCode.data(), errorCode.size() - 36,
+          errorCode.data() + errorCode.size() - 36);
+  expectRejectedStatus(errorCode);
+  uint8_t invalidPadding[16] = {'{', '}'};
+  memset(invalidPadding + 2, 14, 14);
+  invalidPadding[15] = 13;
+  ecb(sessionKey, invalidPadding, 16, MBEDTLS_AES_ENCRYPT);
+  expectRejectedStatus(v34DeviceFrame(3, 0x10,
+                       std::vector<uint8_t>(invalidPadding, invalidPadding + 16)));
+
+  MockClient mock;
+  LynkTuyaDevice<TUYA_V34> dev(IPAddress(1, 2, 3, 4), (const char*)LOCAL_KEY, mock);
+  dev.setTimeout(100);
+  mock.preload(v34PaddedCmd4(true, false, true));
+  CHECK(!dev.handshake());
+}
+
 static void testV35() {
   printf("-- v3.5 --\n");
   uint8_t sessionKey[16];
@@ -551,6 +625,9 @@ static void testUnalignedPayload() {
   bad.push_back(0x42);         // 1 unaligned payload byte
   bad.insert(bad.end(), 32, 0x00);
   bad.insert(bad.end(), {0x00, 0x00, 0xAA, 0x55});
+  uint8_t digest[32];
+  hmac256(sessionKey, bad.data(), bad.size() - 36, digest);
+  memcpy(bad.data() + bad.size() - 36, digest, 32);
 
   mock.preload(bad);
 
@@ -574,6 +651,7 @@ int main() {
   }
 
   testV34Fragmented();
+  testV34AuthenticatedLayouts();
   testV35();
   testV35Fragmented();
   testShortKey();

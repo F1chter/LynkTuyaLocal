@@ -320,16 +320,10 @@ private:
     mbedtls_gcm_context gcm;
     mbedtls_gcm_init(&gcm);
     mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 128);
-    int rc = mbedtls_gcm_starts(&gcm, MBEDTLS_GCM_ENCRYPT, iv, ivLen);
-    if (rc == 0) rc = mbedtls_gcm_update_ad(&gcm, authD, authDLen);
-    if (rc == 0 && plaintextLen > 0) {
-      size_t outLen = 0;
-      rc = mbedtls_gcm_update(&gcm, plaintext, plaintextLen, ciphertext, plaintextLen, &outLen);
-    }
-    if (rc == 0) {
-      size_t finishLen = 0;
-      rc = mbedtls_gcm_finish(&gcm, nullptr, 0, &finishLen, tag, tagLen);
-    }
+    // These one-shot APIs are available in both ESP32 Arduino mbedTLS 2 and 3.
+    int rc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, plaintextLen,
+                                      iv, ivLen, authD, authDLen, plaintext,
+                                      ciphertext, tagLen, tag);
     mbedtls_gcm_free(&gcm);
     LYNK_LOG("Encrypt result code:");
     LYNK_LOGLN(rc);
@@ -349,19 +343,11 @@ private:
     mbedtls_gcm_context gcm;
     mbedtls_gcm_init(&gcm);
     mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 128);
-    int rc = mbedtls_gcm_starts(&gcm, MBEDTLS_GCM_DECRYPT, iv, ivLen);
-    if (rc == 0) rc = mbedtls_gcm_update_ad(&gcm, authD, authDLen);
-    if (rc == 0 && ciphertextLen > 0) {
-      size_t outLen = 0;
-      rc = mbedtls_gcm_update(&gcm, ciphertext, ciphertextLen, plaintext, ciphertextLen, &outLen);
-    }
-    uint8_t computedTag[16];
-    if (rc == 0) {
-      size_t finishLen = 0;
-      rc = mbedtls_gcm_finish(&gcm, nullptr, 0, &finishLen, computedTag, tagLen);
-    }
+    int rc = mbedtls_gcm_auth_decrypt(&gcm, ciphertextLen, iv, ivLen,
+                                     authD, authDLen, tag, tagLen,
+                                     ciphertext, plaintext);
     mbedtls_gcm_free(&gcm);
-    bool ok = (rc == 0) && memcmp(computedTag, tag, tagLen) == 0;
+    bool ok = rc == 0;
     LYNK_LOG("Decrypt ok:");
     LYNK_LOGLN(ok);
     return ok;
@@ -436,13 +422,26 @@ private:
     // so a near-UINT32_MAX value can't wrap `total` to a small number and slip
     // an unbounded read past the check below.
     const size_t suffix = (_VERSION == TUYA_V35) ? 4 : 0;
-    if (length < 8 || length > RESPONSE_BUFFER_SIZE - headerLen - suffix) {
+    if (length < (_VERSION == TUYA_V34 ? 36U : 8U) ||
+        length > RESPONSE_BUFFER_SIZE - headerLen - suffix) {
       LYNK_LOGLN("Frame length out of range");
       return -1;
     }
     size_t total = headerLen + length + suffix;
     if (!_readExact(_response_buffer + headerLen, total - headerLen, start, timeoutMs)) return -1;
     _responseSize = total;
+
+    if (_VERSION == TUYA_V34) {
+      uint8_t expected[32];
+      const uint8_t* key = cmd == 0x04 ? _localKey : _sessionKey;
+      hmacSha256(key, 16, _response_buffer, total - 36, expected);
+      uint8_t mismatch = 0;
+      for (size_t i = 0; i < 32; ++i)
+        mismatch |= expected[i] ^ _response_buffer[total - 36 + i];
+      for (size_t i = 0; i < 4; ++i)
+        mismatch |= _response_buffer[total - 4 + i] ^ pgm_read_byte(V34_SUFFIX_MAGIC + i);
+      if (mismatch) return -1;
+    }
 
     LYNK_LOG("Got frame cmd ");
     LYNK_LOG(cmd);
@@ -561,18 +560,43 @@ private:
   }
 
   bool _parseCommand3ResponseV34() {  //tuya device sent packet with command 04 as response on packet with command 03
-    uint8_t payload[16];              //use only 16/64 that contain remote nonce
-    if (_responseSize < 36)  //header + payload
+    // The optional four-byte return code changes the block alignment of the
+    // frame. The encrypted response contains a nonce and its challenge HMAC.
+    const bool hasRetcode = (_responseSize % 16) == 8;
+    if (!hasRetcode && (_responseSize % 16) != 4)
       return false;
-    memcpy(payload, _response_buffer + 20, 16);
-    LYNK_LOGLN("Encrypted response payload");
-    LYNK_LOG_HEX(payload, 16);
-    //decrypt only first block, that contain remote nonce
-    aesEcbDecrypt(_localKey, payload, 16);
-    LYNK_LOGLN("Decrypted response payload");
-    LYNK_LOG_HEX(payload, 16);
+    if (hasRetcode && readU32BE(_response_buffer + 16) != 0)
+      return false;
+    const size_t overhead = hasRetcode ? 56 : 52;
+    if (_responseSize < overhead + 48 || (_responseSize - overhead) % 16 != 0)
+      return false;
+    const size_t encryptedLen = _responseSize - overhead;
+    uint8_t payload[RESPONSE_BUFFER_SIZE - 52];
+    memcpy(payload, _response_buffer + (hasRetcode ? 20 : 16), encryptedLen);
+    aesEcbDecrypt(_localKey, payload, encryptedLen);
 
-    memcpy(_deviceNonce, payload, 16);
+    size_t offset = 0;
+    if (encryptedLen == 64) {
+      bool versionPrefix = true;
+      for (size_t i = 0; i < 15; ++i)
+        versionPrefix &= payload[i] == pgm_read_byte(V34_PAYLOAD_PREFIX_MAGIC + i);
+      offset = versionPrefix ? 15 : 0;
+      const uint8_t pad = versionPrefix ? 1 : 16;
+      for (size_t i = encryptedLen - pad; i < encryptedLen; ++i)
+        if (payload[i] != pad) return false;
+    } else if (encryptedLen != 48) {
+      return false;
+    }
+
+    uint8_t challenge[16];
+    memcpy_P(challenge, LOCAL_NONCE_PADDED, sizeof(challenge));
+    uint8_t expected[32];
+    hmacSha256(_localKey, 16, challenge, sizeof(challenge), expected);
+    uint8_t mismatch = 0;
+    for (size_t i = 0; i < 32; ++i)
+      mismatch |= payload[offset + 16 + i] ^ expected[i];
+    if (mismatch) return false;
+    memcpy(_deviceNonce, payload + offset, 16);
     LYNK_LOGLN("Device Nonce:");
     LYNK_LOG_HEX(_deviceNonce, 16);
     return true;
@@ -643,22 +667,19 @@ private:
 
   bool _parseCommandResponseV34(bool allowEmptyPayload = false) {
     _lastJson = "";
-    if (_responseSize < 56) {  //header 16 + retcode 4 + hmac 32 + suffix 4
+    if (_responseSize < 52) {  //header 16 + optional retcode 4 + hmac 32 + suffix 4
       LYNK_LOGLN("Response too short to parse");
       return false;
     }
-
-    uint32_t retcode = readU32BE(_response_buffer + 16);
-    LYNK_LOG("retcode = ");
-    LYNK_LOGLN(retcode);
-    (void)retcode;
-
-    if (_responseSize == 56) {
+    const bool hasRetcode = (_responseSize % 16) == 8;
+    if (!hasRetcode && (_responseSize % 16) != 4) return false;
+    if (hasRetcode && readU32BE(_response_buffer + 16) != 0) return false;
+    const size_t offset = hasRetcode ? 20 : 16;
+    const size_t pLen = _responseSize - (hasRetcode ? 56 : 52);
+    if (pLen == 0) {
       LYNK_LOGLN("No payload");
       return allowEmptyPayload;
     }
-
-    size_t pLen = _responseSize - 56;
     // AES-ECB only operates on whole 16-byte blocks; a device (or corrupted
     // frame) that isn't block-aligned would otherwise decrypt a partial block
     // from uninitialised bytes past the payload.
@@ -666,13 +687,16 @@ private:
       LYNK_LOGLN("Response payload not block-aligned");
       return false;
     }
-    uint8_t payload[RESPONSE_BUFFER_SIZE - 56];
-    memcpy(payload, _response_buffer + 20, pLen);
+    uint8_t payload[RESPONSE_BUFFER_SIZE - 52];
+    memcpy(payload, _response_buffer + offset, pLen);
     aesEcbDecrypt(_sessionKey, payload, pLen);
 
     // Strip PKCS7 padding (last byte = padding length)
     uint8_t padLen = payload[pLen - 1];
-    size_t jsonLen = (padLen <= pLen) ? pLen - padLen : pLen;
+    if (padLen < 1 || padLen > 16 || padLen > pLen) return false;
+    for (size_t i = pLen - padLen; i < pLen; ++i)
+      if (payload[i] != padLen) return false;
+    size_t jsonLen = pLen - padLen;
 
     _storeJson(payload, jsonLen);
     LYNK_LOG("Decrypted JSON: ");
